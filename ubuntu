@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# Start a fast, persistent Ubuntu 24.04 session.
+#   ubuntu            interactive shell
+#   ubuntu <command>  run a command inside Ubuntu
+#   ubuntu --reset    delete the saved system and exit
+set -euo pipefail
+
+UBUNTU_VERSION="24.04.5"
+UBUNTU_CODENAME="noble"
+DATA_DIR="${FAST_UBUNTU_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/fast-ubuntu}"
+ROOTFS="$DATA_DIR/rootfs"
+READY="$ROOTFS/var/lib/fast-ubuntu/ready"
+WORKSPACE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+log() { printf 'ubuntu: %s\n' "$*" >&2; }
+die() { log "$*"; exit 1; }
+
+arch_name() {
+  case "$(uname -m)" in
+    x86_64) printf 'amd64\n' ;;
+    aarch64|arm64) printf 'arm64\n' ;;
+    *) die "unsupported architecture: $(uname -m)" ;;
+  esac
+}
+
+tarball_pin() {
+  local arch="$1"
+  case "$arch" in
+    amd64) printf '%s %s\n' \
+      "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-${UBUNTU_VERSION}-base-amd64.tar.gz" \
+      "e77b6f10c2590cef872b33ee9f635a0e3fd1f57fb074c0e52b5c7f56147a0c86" ;;
+    arm64) printf '%s %s\n' \
+      "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-${UBUNTU_VERSION}-base-arm64.tar.gz" \
+      "a91d5a93010193712d346d761372b7c9db6dfcf093893161c64ca107f05914f2" ;;
+    *) die "no Ubuntu base image for $arch" ;;
+  esac
+}
+
+need_root_tools() {
+  [[ "$(id -u)" -eq 0 ]] && die "run ubuntu as your normal user, not root"
+  local missing=()
+  command -v unshare >/dev/null 2>&1 || missing+=(util-linux)
+  command -v newuidmap >/dev/null 2>&1 || missing+=(uidmap)
+  command -v curl >/dev/null 2>&1 || missing+=(curl)
+  command -v flock >/dev/null 2>&1 || missing+=(util-linux)
+  command -v tar >/dev/null 2>&1 || missing+=(tar)
+  command -v ps >/dev/null 2>&1 || missing+=(procps)
+  if ((${#missing[@]})); then
+    command -v sudo >/dev/null 2>&1 || die "install these packages, then retry: ${missing[*]}"
+    log "installing host tools: ${missing[*]}"
+    sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+  fi
+}
+
+ensure_subids() {
+  local user start count
+  user="$(id -un)"
+  start="$(awk -F: -v u="$user" '$1==u {print $2; exit}' /etc/subuid 2>/dev/null || true)"
+  count="$(awk -F: -v u="$user" '$1==u {print $3; exit}' /etc/subuid 2>/dev/null || true)"
+  if [[ -z "$start" || -z "$count" ]]; then
+    command -v sudo >/dev/null 2>&1 || die "add $user to /etc/subuid and /etc/subgid (uidmap)"
+    log "granting $user a user-namespace id range"
+    grep -q "^${user}:" /etc/subuid 2>/dev/null || echo "${user}:100000:65536" | sudo tee -a /etc/subuid >/dev/null
+    grep -q "^${user}:" /etc/subgid 2>/dev/null || echo "${user}:100000:65536" | sudo tee -a /etc/subgid >/dev/null
+    start="$(awk -F: -v u="$user" '$1==u {print $2; exit}' /etc/subuid)"
+    count="$(awk -F: -v u="$user" '$1==u {print $3; exit}' /etc/subuid)"
+  fi
+  [[ -n "$start" && "$count" -ge 1000 ]] || die "user-namespace id range for $user is too small"
+  SUBUID_START="$start"
+  SUBUID_COUNT="$count"
+  SUBGID_START="$(awk -F: -v u="$user" '$1==u {print $2; exit}' /etc/subgid)"
+  SUBGID_COUNT="$(awk -F: -v u="$user" '$1==u {print $3; exit}' /etc/subgid)"
+  [[ -n "$SUBGID_START" && -n "$SUBGID_COUNT" ]] || die "missing /etc/subgid entry for $user"
+}
+
+ensure_rootfs() {
+  mkdir -p "$DATA_DIR"
+  exec 9>"$DATA_DIR/lock"
+  flock 9
+  if [[ ! -x "$ROOTFS/bin/bash" ]]; then
+    local arch url sum tmp
+    arch="$(arch_name)"
+    read -r url sum < <(tarball_pin "$arch")
+    tmp="$(mktemp -d "$DATA_DIR/download.XXXXXX")"
+    log "downloading Ubuntu ${UBUNTU_VERSION} (${arch}, about 30MB, once)"
+    curl -fsSL --retry 3 --retry-delay 1 -o "$tmp/base.tar.gz" "$url"
+    if ! echo "${sum}  $tmp/base.tar.gz" | sha256sum -c --status; then
+    die "Ubuntu download failed its checksum"
+  fi
+    rm -rf "$ROOTFS"
+    mkdir -p "$ROOTFS"
+    tar --no-same-owner -C "$ROOTFS" -xzf "$tmp/base.tar.gz"
+    rm -rf "$tmp"
+    printf 'ubuntu\n' > "$ROOTFS/etc/hostname"
+    cat > "$ROOTFS/etc/hosts" <<'EOF'
+127.0.0.1 localhost
+127.0.1.1 ubuntu
+::1 localhost ip6-localhost ip6-loopback
+EOF
+    mkdir -p "$ROOTFS/etc/profile.d" "$ROOTFS/workspace" "$ROOTFS/var/lib/fast-ubuntu"
+    cat > "$ROOTFS/etc/profile.d/fast-ubuntu.sh" <<EOF
+# Added by the fast Ubuntu launcher.
+export LANG="\${LANG:-C.UTF-8}"
+force_color_prompt=yes
+if [ -n "\$PS1" ]; then
+  printf 'Ubuntu ${UBUNTU_VERSION} LTS  (fast)   workspace: /workspace\\n'
+fi
+EOF
+    log "extracted to $ROOTFS"
+  fi
+  flock -u 9
+  exec 9>&-
+}
+
+wait_for_idmap() {
+  local i
+  for i in $(seq 1 250); do
+    if awk 'NR==1 && $1==0 && $2!=0 {ok=1} END{exit ok?0:1}' /proc/self/uid_map 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.02
+  done
+  die "timed out waiting for the user namespace"
+}
+
+map_namespace() {
+  local shell_pid="$1" i unshare_pid target uid_done=""
+  for i in $(seq 1 250); do
+    unshare_pid="$(ps -o pid=,comm= --ppid "$shell_pid" | awk '$2=="unshare" {print $1; exit}')"
+    if [[ -n "${unshare_pid:-}" ]]; then
+      target="$(ps -o pid= --ppid "$unshare_pid" | awk 'NR==1 {print $1}')"
+      if [[ -n "${target:-}" ]]; then
+        if [[ -z "${uid_done:-}" ]] && newuidmap "$target" 0 "$(id -u)" 1 1 "$SUBUID_START" "$SUBUID_COUNT" 2>/dev/null; then
+          uid_done=1
+        fi
+        if [[ -n "${uid_done:-}" ]] && newgidmap "$target" 0 "$(id -g)" 1 1 "$SUBGID_START" "$SUBGID_COUNT" 2>/dev/null; then
+          return 0
+        fi
+      fi
+    fi
+    sleep 0.02
+  done
+  return 1
+}
+
+mount_rootfs() {
+  local rootfs="$1" workspace="$2" resolv
+  hostname ubuntu
+  mkdir -p "$rootfs"/{proc,sys,dev,tmp,run,workspace,etc}
+  mountpoint -q "$rootfs/proc" || mount -t proc proc "$rootfs/proc"
+  if ! mountpoint -q "$rootfs/sys"; then
+    mount -t sysfs sysfs "$rootfs/sys" 2>/dev/null || mount --rbind /sys "$rootfs/sys"
+  fi
+  mountpoint -q "$rootfs/dev" || mount --rbind /dev "$rootfs/dev"
+  mountpoint -q "$rootfs/tmp" || mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs "$rootfs/tmp"
+  mountpoint -q "$rootfs/run" || mount -t tmpfs -o mode=755,nosuid,nodev tmpfs "$rootfs/run"
+  resolv="$(readlink -f /etc/resolv.conf)"
+  [[ -f "$resolv" ]] || die "host /etc/resolv.conf is missing"
+  touch "$rootfs/etc/resolv.conf"
+  mountpoint -q "$rootfs/etc/resolv.conf" || mount --bind "$resolv" "$rootfs/etc/resolv.conf"
+  mkdir -p "$rootfs/workspace"
+  mountpoint -q "$rootfs/workspace" || mount --bind "$workspace" "$rootfs/workspace"
+}
+
+bootstrap() {
+  local rootfs="$1" logf
+  [[ -f "$rootfs/var/lib/fast-ubuntu/ready" ]] && return 0
+  log "installing base packages (first launch only)"
+  logf="$(mktemp)"
+  if ! chroot "$rootfs" /usr/bin/env \
+    DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    /bin/bash -c '
+      set -euo pipefail
+      apt-get update -qq
+      apt-get install -y -qq -o Dpkg::Use-Pty=0 --no-install-recommends \
+        bash-completion ca-certificates curl iproute2 less nano passwd procps sudo
+      mkdir -p /var/lib/fast-ubuntu
+      touch /var/lib/fast-ubuntu/ready
+    ' >"$logf" 2>&1; then
+    cat "$logf" >&2
+    rm -f "$logf"
+    die "base package install failed"
+  fi
+  rm -f "$logf"
+}
+
+enter() {
+  local mode="$1"
+  shift
+  local rootfs="$1" workspace="$2"
+  shift 2
+  wait_for_idmap
+  mount_rootfs "$rootfs" "$workspace"
+  unset LC_ALL LC_CTYPE LC_NUMERIC LC_TIME LC_COLLATE LC_MONETARY LC_MESSAGES \
+    LC_PAPER LC_NAME LC_ADDRESS LC_TELEPHONE LC_MEASUREMENT LC_IDENTIFICATION || true
+  export LANG=C.UTF-8
+  if [[ "$mode" == "bootstrap" ]]; then
+    bootstrap "$rootfs"
+    return 0
+  fi
+  export HOME=/root USER=root LOGNAME=root
+  export LANG=C.UTF-8
+  export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  export TERM="${TERM:-xterm-256color}"
+  unset LC_ALL || true
+  if [[ "$mode" == "shell" ]]; then
+    exec chroot "$rootfs" /bin/bash -c 'cd /workspace && exec bash -l'
+  fi
+  exec chroot "$rootfs" /bin/bash -c 'cd /workspace && exec "$@"' _ "$@"
+}
+
+run_inside() {
+  local mode="$1"
+  shift
+  local shell_pid="$$" mapper status
+  map_namespace "$shell_pid" || die "could not create the Ubuntu user namespace" &
+  mapper="$!"
+  set +e
+  unshare \
+    --user --mount --uts --fork --pid --mount-proc --propagation private --kill-child \
+    "$0" --inside "$mode" "$ROOTFS" "$WORKSPACE" "$@"
+  status=$?
+  set -e
+  wait "$mapper" 2>/dev/null || true
+  return "$status"
+}
+
+if [[ "${1:-}" == "--inside" ]]; then
+  mode="${2:?}"
+  rootfs="${3:?}"
+  workspace="${4:?}"
+  shift 4
+  enter "$mode" "$rootfs" "$workspace" "$@"
+  exit 0
+fi
+
+if [[ "$(uname -s)" != "Linux" ]]; then
+  die "this Ubuntu session runs on Linux (including GitHub Codespaces)"
+fi
+
+if [[ "${1:-}" == "--reset" ]]; then
+  if [[ -d "$DATA_DIR" ]]; then
+    rm -rf "$DATA_DIR"
+    log "removed $DATA_DIR"
+  else
+    log "nothing to reset"
+  fi
+  exit 0
+fi
+
+need_root_tools
+ensure_subids
+ensure_rootfs
+
+if [[ ! -f "$READY" ]]; then
+  exec 9>"$DATA_DIR/lock"
+  flock 9
+  if [[ ! -f "$READY" ]]; then
+    run_inside bootstrap
+  fi
+  flock -u 9
+  exec 9>&-
+fi
+
+if [[ $# -eq 0 ]]; then
+  run_inside shell
+else
+  run_inside exec "$@"
+fi
