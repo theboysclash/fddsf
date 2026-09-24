@@ -1,0 +1,17 @@
+{
+  "name": "Fast Ubuntu",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "postCreateCommand": "sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends uidmap curl ca-certificates && sudo ln -sfn \"${containerWorkspaceFolder}/ubuntu\" /usr/local/bin/ubuntu",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.profiles.linux": {
+          "Ubuntu": {
+            "path": "/usr/local/bin/ubuntu",
+            "icon": "terminal-linux"
+          }
+        }
+      }
+    }
+  }
+}
